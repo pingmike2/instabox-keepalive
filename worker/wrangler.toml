@@ -1,11 +1,12 @@
 name = "instabox-keepalive"
 main = "worker.js"
-compatibility_date = "2026-10-16"
+compatibility_date = "2026-10-20"
 
-# 每 9 分钟续一次 15 分钟的租约（cron 最小粒度 1 分钟）
-# 注意 TTL 必须大于 cron 间隔，否则两次续租之间会空窗：间隔 9 分钟就填 900
+# 每 5 分钟续一次 15 分钟的租约（cron 最小粒度 1 分钟）。
+# 用 5 分钟是因为定时轮转的「时间点」都落在整点/半点上：*/5 能精确命中，*/9 会晚最多 9 分钟。
+# 注意 TTL 必须大于 cron 间隔，否则两次续租之间会空窗：间隔 5 分钟填 900 绰绰有余
 [triggers]
-crons = ["*/9 * * * *"]
+crons = ["*/5 * * * *"]
 
 [vars]
 # 非密钥的配置；INSTABOX_API_KEY（以及多账号的 _2、_3 …）用 `npx wrangler secret put ...` 存
@@ -17,6 +18,28 @@ INSTABOX_LEASE_TTL = "900"
 INSTABOX_LOG_MODE = "hourly"
 # 机器被挂起/停掉后续租会 409 machine_not_running：默认先 resume（stopped 用 start 兜底）再续租，设 0 关掉
 INSTABOX_AUTO_RESUME = "1"
+# ── 停机检修轮转（默认开，下面的值就是代码里的默认值）──────────────────
+# 不写 INSTABOX_CYCLE_AT 就用默认时间点 01:30/08:00/13:00/19:00；写 INSTABOX_PEAK_HOURS 则自动排。
+# 想让 Worker 回到「只续租、绝不主动重启」的行为，只加这一行：
+# INSTABOX_CYCLE = "0"
+# 注意：CYCLE=0 时 INSTABOX_CYCLE_AT 配了也不生效（/status 里会有 cycleWarning 提示）。
+#
+# 兜底：剩多少分钟就开始轮转（机器多要调大，至少 cron 间隔 × 机器数，每轮只转一台）
+# INSTABOX_CYCLE_MARGIN_MIN = "20"
+# 固定时间点（本地时间，逗号分隔，间隔必须 < 8 小时）；这套避开高峰 10-12 / 14-18 / 20-23
+# INSTABOX_CYCLE_AT = "01:30,08:00,13:00,19:00"
+# INSTABOX_CYCLE_TZ = "Asia/Shanghai"
+# 到点后多少分钟内允许触发（cron 5 分钟一轮，30 分钟 = 6 次机会）；同一个点只转一次
+# INSTABOX_CYCLE_WINDOW_MIN = "30"
+#
+# 懒人版：不写 CYCLE_AT，只填高峰时段，Worker 自动排重启点（全落在空档、间隔 ≤7h）：
+# INSTABOX_PEAK_HOURS = "10-12,14-18,20-23"      # → 00:00,06:00,12:00,18:00
+#
+# 随机抖动（默认关；开了就不再准点，按需取舍）：
+# INSTABOX_CYCLE_JITTER_MIN = "0-0"    # 开始时间抖动：0-15 = 8:00 落在 8:00-8:15
+# INSTABOX_CYCLE_HOLD_SEC = "0-0"      # 停机时长：600-900 = 停 10-15 分钟（>600 秒要绑 KV）
+# INSTABOX_WAKE_JITTER_MIN = "0-0"     # 平台冷却后再等：0-5 = 总停机 10-15 分钟随机
+
 # 多账号：第 N 个账号 = 单账号变量名加 _N 后缀，加一个账号就多存一个 secret（别把 key 写进这个文件）：
 #   npx wrangler secret put INSTABOX_API_KEY_2      # 2 号账号
 #   npx wrangler secret put INSTABOX_API_KEY_3      # 3 号账号，依此类推

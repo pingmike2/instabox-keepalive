@@ -154,7 +154,7 @@ docker compose run --rm instabox-keepalive --status
 
 ## Cloudflare Worker 部署（附加方案）
 
-没有常开的机器也不影响保活：把续租放到 Cloudflare Worker 上，cron 每 9 分钟自动跑一次，和你的任何机器无关。推荐网页面板部署（不用装 wrangler），想用命令行看最后面的《CLI 部署》。
+没有常开的机器也不影响保活：把续租放到 Cloudflare Worker 上，cron 每 5 分钟自动跑一次，和你的任何机器无关。推荐网页面板部署（不用装 wrangler），想用命令行看最后面的《CLI 部署》。
 
 ### 部署步骤
 
@@ -174,8 +174,8 @@ docker compose run --rm instabox-keepalive --status
    | `INSTABOX_API_URL` | Text | `https://api.instabox.sh`（换私有网关时才用加这个变量） |
 
    > `TOKEN` 强烈建议一定要设：不设的话，任何知道你 Worker 域名的人都能触发续租/释放。
-   > `INSTABOX_LEASE_TTL` 要比 cron 间隔大：间隔 9 分钟就填 `900`，填 `300` 会在两次续租之间出现空窗。
-4. `Settings` → `Triggers` → `Cron Triggers` → `Add Cron Trigger`，填 `*/9 * * * *`（每 9 分钟）→ 保存。这就是自动保活的开关
+   > `INSTABOX_LEASE_TTL` 要比 cron 间隔大：cron 是 5 分钟，填 `900` 有 3 倍余量。
+4. `Settings` → `Triggers` → `Cron Triggers` → `Add Cron Trigger`，填 `*/5 * * * *`（每 5 分钟）→ 保存。这就是自动保活的开关
 5. 想看 `/log`：`Storage & Databases` → `KV` → `Create namespace`，然后在 Worker 的 `Settings` → `Bindings` 里加一个 KV 绑定，**变量名填 `LOG`**、选刚建的空间。不绑也能用，只是 `/log` 是空的
 
 部署完打开 `/accounts?token=...`，看到 `#1`、`#2`、`#3` 三行（key 打码）就说明三把 key 都认到了；再打开 `/status?token=...` 看每个账号下的机器。
@@ -190,6 +190,18 @@ docker compose run --rm instabox-keepalive --status
 ## 机器被挂起/停掉会怎样
 
 续租对 `suspended` / `stopped` 的机器一律回 `409 machine_not_running`——光续租是空转，机器不会自己醒。默认 `INSTABOX_AUTO_RESUME=1`：碰到这个错就先 `POST /resume`（`stopped` 的用 `/start` 兜底），等它变成 `running` 再立刻续租；日志里这条会带 `"resumed":true` 和 `"wake":["resume:202"]`。设成 `0` 就只报错、不唤醒。
+
+## 停机检修轮转（Worker 版默认开）
+
+机器长期不重启会撞上平台的「最长运行」冷却；Worker 现在默认带**检修轮转**：到点主动把机器 suspend 再 resume，一分钟一台、错开进行，避开你的使用高峰。
+
+- 默认时间表（本地时间 `Asia/Shanghai`）：`01:30 / 08:00 / 13:00 / 19:00`，到点后 30 分钟内允许触发，同一个点每台只转一次
+- 连续运行**剩 20 分钟**到上限时兜底轮转（`INSTABOX_CYCLE_MARGIN_MIN` 可调，0 = 关掉兜底只按时间点）
+- **只续租、绝不主动重启**（回到旧行为）：加一个 Text 变量 `INSTABOX_CYCLE = "0"`
+- 懒人版自动排点：`INSTABOX_PEAK_HOURS = "10-12,14-18,20-23"`，Worker 自己把重启点排进空档
+- 随机抖动（默认关）：`INSTABOX_CYCLE_JITTER_MIN`（开始时间）、`INSTABOX_CYCLE_HOLD_SEC`（停机时长）、`INSTABOX_WAKE_JITTER_MIN`（平台冷却后额外等待）
+- 多账号可单独覆盖：`INSTABOX_CYCLE_2`、`INSTABOX_CYCLE_MARGIN_MIN_2`…（同 `_N` 后缀规则）
+- `/status` 里能看到每台的 `nextCycle`（下次轮转时间）；`CYCLE=0` 却配了时间点时会有 `cycleWarning` 提示
 
 ## 接口
 
@@ -213,7 +225,7 @@ https://<你的worker>.workers.dev/status?token=xxx&account=2   只看 2 号账�
 
 | cron 间隔 | 次数/天 | `every` 模式写/天 | `hourly` 模式写/天 |
 | --- | --- | --- | --- |
-| `*/9` | 160 | 160 | ~24 |
+| `*/5` | 288 | 288 | ~24 |
 | `*/4` | 360 | 360 | ~24 |
 | `* * * * *` | 1440 | **1440（超了）** | ~24 |
 
@@ -231,7 +243,7 @@ npx wrangler secret put TOKEN
 npx wrangler deploy
 ```
 
-`worker/wrangler.toml` 里已经设好 `crons = ["*/9 * * * *"]` 和 `INSTABOX_LEASE_TTL = "900"`，按需改就行。
+`worker/wrangler.toml` 里已经设好 `crons = ["*/5 * * * *"]` 和 `INSTABOX_LEASE_TTL = "900"`，按需改就行。
 
 ## 致谢
 
