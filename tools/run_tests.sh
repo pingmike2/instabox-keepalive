@@ -88,13 +88,14 @@ stop_mock() {
 run_ka() {
 	scen=$1
 	shift
-	start_mock "$scen" "--ttl 900" || return 1
+	start_mock "$scen" "--ttl 900 ${KA_MOCK_ARGS:-}" || return 1
 	env -i PATH="$PATH" HOME="${HOME:-/tmp}" \
 		INSTABOX_API_URL="http://127.0.0.1:$MOCK_PORT" \
 		INSTABOX_API_KEY=ibk_testkey0001 \
 		INSTABOX_ENV_FILE=/dev/null \
 		INSTABOX_WAKE_GAP=0 \
 		INSTABOX_WAKE_TRIES=2 \
+		${KA_ENV:-} \
 		sh "$REPO/keepalive.sh" "$@" 2>&1
 }
 
@@ -174,6 +175,58 @@ test_shell() {
 	has "账号 1/2" "账号 1/2" "$out"
 	has "账号 2/2" "账号 2/2" "$out"
 	[ "$(printf '%s' "$out" | grep -c '续租 ok')" = "2" ] && ok "两把 key 各续一次" || bad "两把 key 各续一次" "$out"
+
+	sec "轮转：快到 max-run 上限触发（limit 兜底）+ 同一点只转一次"
+	# 主 shell 直接起 mock（别走 run_ka：$( ) 子 shell 退出会触发继承的 trap 把 mock 杀掉）
+	KA_MOCK_ARGS=""
+	start_mock running "--ttl 900 --maxrun 480 --started-age 470" || return 0
+	run_ka_inline() {
+		env -i PATH="$PATH" HOME="${HOME:-/tmp}" \
+			INSTABOX_API_URL="http://127.0.0.1:$MOCK_PORT" \
+			INSTABOX_API_KEY=ibk_testkey0001 \
+			INSTABOX_ENV_FILE=/dev/null \
+			INSTABOX_WAKE_GAP=0 \
+			sh "$REPO/keepalive.sh" --once 2>&1
+	}
+	out=$(run_ka_inline)
+	log=$(reqlog)
+	has "limit 触发轮转" "轮转(limit)" "$out"
+	has "suspend 被调用" "POST /v1/machines/m_test/suspend 202" "$log"
+	has "轮转后续租成功" "续租 ok（轮转后）" "$out"
+	has "轮转完成标记" "连续运行计时已清零" "$out"
+
+	# 第二轮复用同一个 mock：resume 已把 runStartedAt 刷成现在，不该再转
+	out=$(run_ka_inline)
+	nhas "第二轮不再轮转" "轮转(" "$out"
+	has "第二轮照常续租" "续租 ok" "$out"
+	stop_mock
+
+	sec "轮转：INSTABOX_CYCLE=0 关闭"
+	KA_MOCK_ARGS="--maxrun 480 --started-age 470"
+	KA_ENV="INSTABOX_CYCLE=0"
+	out=$(run_ka running --once)
+	log=$(reqlog)
+	nhas "没有 suspend" "/suspend" "$log"
+	has "照常续租" "续租 ok" "$out"
+	stop_mock
+
+	sec "轮转：到点窗口触发（slot）"
+	KA_MOCK_ARGS="--started-age 600"
+	KA_ENV="INSTABOX_CYCLE_AT=$(date -u +%H:%M) INSTABOX_CYCLE_TZ=UTC"
+	out=$(run_ka running --once)
+	has "slot 触发轮转" "轮转(slot)" "$out"
+	has "轮转日志带机器标签" "轮转(slot) testbox:" "$out"
+	stop_mock
+
+	sec "轮转：冷却中跳过（不白打唤醒接口）"
+	KA_MOCK_ARGS="--cooldown-minutes 5"
+	KA_ENV="INSTABOX_CYCLE=0"
+	out=$(run_ka suspended --once)
+	has "提示冷却中" "冷却中" "$out"
+	log=$(reqlog)
+	nhas "没打续租" "activity-leases/keepalive 20" "$log"
+	nhas "没打 resume" "/resume" "$log"
+	stop_mock
 
 	sec "keepalive.sh TTL 越界要拒绝"
 	out=$(env -i PATH="$PATH" INSTABOX_API_KEY=ibk_x INSTABOX_ENV_FILE=/dev/null INSTABOX_LEASE_TTL=5 \

@@ -203,6 +203,15 @@ docker compose run --rm instabox-keepalive --status
 - 多账号可单独覆盖：`INSTABOX_CYCLE_2`、`INSTABOX_CYCLE_MARGIN_MIN_2`…（同 `_N` 后缀规则）
 - `/status` 里能看到每台的 `nextCycle`（下次轮转时间）；`CYCLE=0` 却配了时间点时会有 `cycleWarning` 提示
 
+### keepalive.sh / Docker 版（默认开，同名变量）
+
+keepalive.sh 移植了同一套轮转逻辑（`--watch` 常驻和 cron `--once` 两种跑法都生效；每轮最多转一台，其余排队下一轮），变量名与 Worker 版一致，`docker/.env.example` 里都有注释：
+
+- 默认同样 `01:30 / 08:00 / 13:00 / 19:00`（`Asia/Shanghai`）+ 剩 20 分钟兜底，每轮最多转一台
+- 关掉：`.env`（或 systemd unit）里 `INSTABOX_CYCLE=0`
+- 与 Worker 版的两点差异：没有 `INSTABOX_PEAK_HOURS` 自动排点、停机时长封顶 600 秒（Worker 超 10 分钟走 KV 存储，sh 版直接封顶）；`--status` 会多打一行每台的 `maxRun 剩 Xmin`
+- 平台 max-run 强制挂起的冷却期内（`cooldownUntil` 未到）自动跳过，不白打唤醒接口
+
 ## 接口
 
 ```
