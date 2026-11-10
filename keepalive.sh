@@ -83,6 +83,22 @@ reload_runtime() { # .env / 环境变量里的值最终生效一次
 	TTL=${INSTABOX_LEASE_TTL:-$TTL}
 	RENEW=${INSTABOX_RENEW_EVERY:-$((TTL * 3 / 5))}
 	AUTO_RESUME=${INSTABOX_AUTO_RESUME:-1}
+	# 停机检修轮转（与 worker 版同款语义；CYCLE=0 只续租、绝不主动重启）
+	CY_ON=1
+	case "${INSTABOX_CYCLE:-1}" in
+		0|off|false|no|OFF|FALSE|NO) CY_ON=0 ;;
+	esac
+	CY_AT=${INSTABOX_CYCLE_AT:-01:30,08:00,13:00,19:00}
+	CY_TZ=${INSTABOX_CYCLE_TZ:-Asia/Shanghai}
+	CY_WINDOW=${INSTABOX_CYCLE_WINDOW_MIN:-30}
+	CY_MARGIN=${INSTABOX_CYCLE_MARGIN_MIN:-20}
+	CY_JITTER=${INSTABOX_CYCLE_JITTER_MIN:-0-0}
+	CY_HOLD=${INSTABOX_CYCLE_HOLD_SEC:-0-0}
+	CY_WAKE_J=${INSTABOX_WAKE_JITTER_MIN:-0-0}
+	case "$CY_WINDOW" in ''|*[!0-9]*) CY_WINDOW=30 ;; esac
+	[ "$CY_WINDOW" -gt 720 ] 2>/dev/null && CY_WINDOW=720
+	case "$CY_MARGIN" in ''|*[!0-9]*) CY_MARGIN=20 ;; esac
+	[ "$CY_MARGIN" -gt 120 ] 2>/dev/null && CY_MARGIN=120
 	ALL=0
 	case "$MACHINE" in ""|all|ALL|All|'*') ALL=1 ;; esac
 	return 0
@@ -241,7 +257,225 @@ wake_one() { # wake_one <id> <label>；0=已经 running
 	return 1
 }
 
+# ---- 停机检修轮转（与 worker 版同款语义）--------------------------------------
+# 到点（默认 01:30/08:00/13:00/19:00 本地时间）或快到 max-run 上限时，
+# 主动 suspend → resume 把「连续运行」计时清零，绕开平台的强制挂起 + 10 分钟冷却。
+# 每轮（一次 renew）最多轮转一台：CYCLED_ROUND 在 renew_round 里清零、renew_one 里置位。
+
+iso_epoch() { # iso_epoch <RFC3339> -> epoch 秒（纯算术，busybox/GNU 通用）；失败输出空
+	v=$1
+	case "$v" in ''|*[!0-9T:.Z+-]*) return 0 ;; esac
+	# 去毫秒；解析 ±HH:MM 时区偏移（Z = 0）
+	off=0
+	case "$v" in
+		*[+-][0-9][0-9]:[0-9][0-9]*)
+			os=${v##*[+-]}
+			oh=${os%%:*}; om=${os#*:}
+			case "$v" in *-*) off=-1 ;; *) off=1 ;; esac
+			off=$((off * (oh * 3600 + om * 60)))
+			;;
+	esac
+	Y=$(printf '%s' "$v" | cut -c1-4); Mo=$(printf '%s' "$v" | cut -c6-7)
+	D=$(printf '%s' "$v" | cut -c9-10); h=$(printf '%s' "$v" | cut -c12-13)
+	mi=$(printf '%s' "$v" | cut -c15-16); s=$(printf '%s' "$v" | cut -c18-19)
+	for x in "$Y" "$Mo" "$D" "$h" "$mi" "$s"; do
+		case "$x" in ''|*[!0-9]*) return 0 ;; esac
+	done
+	awk -v Y="$Y" -v Mo="$Mo" -v D="$D" -v h="$h" -v mi="$mi" -v s="$s" -v off="$off" 'BEGIN{
+		y = Y; if (Mo <= 2) { y -= 1; Mo += 12 }
+		era = int(y / 400); yoe = y - era * 400
+		doy = int((153 * (Mo - 3) + 2) / 5) + D - 1
+		doe = yoe * 365 + int(yoe / 4) - int(yoe / 100) + doy
+		days = era * 146097 + doe - 719468
+		print days * 86400 + h * 3600 + mi * 60 + s - off
+	}'
+}
+
+stable_rand() { # stable_rand <seed> <span> -> 0..span-1（同一种子结果稳定，与 worker 的 stableRand 同思路）
+	[ "$2" -gt 0 ] 2>/dev/null || { printf 0; return; }
+	awk -v s="$1" -v n="$2" 'BEGIN{srand(s + 0); printf "%d", int(rand() * n)}'
+}
+
+parse_rng() { # parse_rng <"min-max"> <默认min> <默认max> <上限> -> RMIN RMAX
+	RMIN=$2; RMAX=$3
+	case "$1" in
+		''|*[!0-9-]*) return 0 ;;
+		*-*)
+			a=${1%%-*}; b=${1#*-}
+			case "$a$b" in *[!0-9]*|'') return 0 ;; esac
+			[ "$a" -le "$4" ] 2>/dev/null && RMIN=$a
+			if [ "$b" -le "$4" ] 2>/dev/null && [ "$b" -ge "$RMIN" ]; then RMAX=$b; fi
+			;;
+		*) [ "$1" -le "$4" ] 2>/dev/null && { RMIN=$1; RMAX=$1; } ;;
+	esac
+	return 0
+}
+
+tz_offset() { # tz_offset <now_epoch> -> OFF（本地 = UTC + OFF）；TZ 无效/不支持时 0
+	z=$(TZ="$CY_TZ" date +%z 2>/dev/null)
+	case "$z" in
+		[+-][0-9][0-9][0-9][0-9]) ;;
+		*) OFF=0; return 0 ;;
+	esac
+	sg=1
+	case "$z" in -*) sg=-1 ;; esac
+	hh=${z#?}; hh=${hh%%??}; mm=${z#???}
+	case "$hh" in 0[0-9]) hh=${hh#0} ;; esac
+	case "$mm" in 0[0-9]) mm=${mm#0} ;; esac
+	OFF=$((sg * (hh * 3600 + mm * 60)))
+}
+
+slot_check() { # slot_check <now_epoch> -> CY_DUE=0/1、CY_EFF=生效时刻、CY_SLOT=命中的点
+	CY_DUE=0
+	[ "$CY_ON" = "1" ] || return 0
+	[ -n "$CY_AT" ] || return 0
+	tz_offset "$1"
+	# 本地当天零点的 UTC epoch
+	lm=$((($1 + OFF) / 86400 * 86400 - OFF))
+	best=0; best_pt=""; last_h=0; last_m=0
+	for pt in $(printf '%s\n' "$CY_AT" | tr ',' ' '); do
+		hh=${pt%%:*}; mm=${pt#*:}
+		case "$hh$mm" in *[!0-9]*|'') continue ;; esac
+		case "$hh" in 0[0-9]) hh=${hh#0} ;; esac
+		case "$mm" in 0[0-9]) mm=${mm#0} ;; esac
+		[ "$hh" -le 23 ] 2>/dev/null && [ "$mm" -le 59 ] 2>/dev/null || continue
+		last_h=$hh; last_m=$mm
+		cand=$((lm + hh * 3600 + mm * 60))
+		if [ "$cand" -le "$1" ] && [ "$cand" -gt "$best" ]; then best=$cand; best_pt=$pt; fi
+	done
+	# 跨零点：今天的点都还没到，看昨天最后一班
+	cand=$((lm - 86400 + last_h * 3600 + last_m * 60))
+	if [ "$cand" -le "$1" ] && [ "$cand" -gt "$best" ]; then best=$cand; best_pt=$(printf '%02d:%02d' "$last_h" "$last_m"); fi
+	[ "$best" -gt 0 ] || return 0
+	parse_rng "$CY_JITTER" 0 0 30
+	eff=$((best + $(stable_rand "$best" $((RMAX - RMIN + 1))) * 60))
+	if [ "$1" -ge "$eff" ] && [ $(($1 - eff)) -le $((CY_WINDOW * 60)) ]; then
+		CY_DUE=1
+		CY_EFF=$eff
+		CY_SLOT=$best_pt
+	fi
+	return 0
+}
+
+next_slot() { # 下一个还没到的时间点（--status / watch 启动时提示用）-> NEXT_AT
+	NEXT_AT=""
+	[ "$CY_ON" = "1" ] && [ -n "$CY_AT" ] || return 0
+	now=$(date +%s)
+	tz_offset "$now"
+	lm=$((($now + OFF) / 86400 * 86400 - OFF))
+	best=0; best_pt=""; first_h=0; first_m=0
+	for pt in $(printf '%s\n' "$CY_AT" | tr ',' ' '); do
+		hh=${pt%%:*}; mm=${pt#*:}
+		case "$hh$mm" in *[!0-9]*|'') continue ;; esac
+		case "$hh" in 0[0-9]) hh=${hh#0} ;; esac
+		case "$mm" in 0[0-9]) mm=${mm#0} ;; esac
+		[ "$first_h" = 0 ] && [ "$first_m" = 0 ] && { first_h=$hh; first_m=$mm; }
+		cand=$((lm + hh * 3600 + mm * 60))
+		if [ "$cand" -gt "$now" ] && { [ "$best" = 0 ] || [ "$cand" -lt "$best" ]; }; then best=$cand; best_pt=$pt; fi
+	done
+	[ "$best" -gt 0 ] || best=$((lm + 86400 + first_h * 3600 + first_m * 60))
+	NEXT_AT=${best_pt:-$(printf '%02d:%02d' "$first_h" "$first_m")}
+}
+
+machine_view() { # machine_view <id> -> V_STATE V_MAXRUN V_REMAIN V_COOL（供轮转判断）
+	http GET "/v1/machines/$1" || return 1
+	V_STATE=$(jget "$HTTP_BODY" state)
+	V_MAXRUN=$(jget "$HTTP_BODY" maxRunMinutes)
+	V_COOL=$(jget "$HTTP_BODY" cooldownUntil)
+	V_START=$(jget "$HTTP_BODY" runStartedAt)
+	V_REMAIN=""
+	case "$V_MAXRUN" in ''|*[!0-9]*) V_MAXRUN=-1 ;; esac
+	if [ "$V_MAXRUN" -gt 0 ]; then
+		se=$(iso_epoch "$V_START")
+		case "$se" in ''|*[!0-9]*) se="" ;; esac
+		[ -n "$se" ] && V_REMAIN=$(( (se + V_MAXRUN * 60 - $(date +%s)) / 60 ))
+	fi
+	return 0
+}
+
+decide_cycle() { # decide_cycle <id> <label> -> 0=轮转(CY_TRIGGER) 1=不轮转 2=冷却中整台跳过
+	machine_view "$1" || return 1
+	now=$(date +%s)
+	# 平台 max-run 强制挂起的冷却期：所有唤醒路径都被拒，别白打接口（worker 版同款跳过）
+	if [ -n "$V_COOL" ] && [ "$V_STATE" != "running" ]; then
+		ce=$(iso_epoch "$V_COOL")
+		case "$ce" in ''|*[!0-9]*) ce="" ;; esac
+		if [ -n "$ce" ] && [ "$ce" -gt "$now" ]; then
+			parse_rng "$CY_WAKE_J" 0 0 30
+			wake_at=$((ce + $(stable_rand "$ce" $((RMAX - RMIN + 1))) * 60))
+			[ "$wake_at" -gt "$now" ] && { log "冷却中 $2: $(TZ=UTC date -u -d "@$wake_at" +%H:%M 2>/dev/null || date -u -r "$wake_at" +%H:%M 2>/dev/null) 后才能唤醒，这轮跳过"; return 2; }
+		fi
+	fi
+	[ "$CY_ON" = "1" ] || return 1
+	[ "$V_STATE" = "running" ] || return 1
+	slot_check "$now"
+	se=$(iso_epoch "$V_START"); case "$se" in ''|*[!0-9]*) se=0 ;; esac
+	if [ "$CY_DUE" = "1" ] && [ "$se" -lt "$CY_EFF" ]; then
+		CY_TRIGGER=slot; return 0
+	fi
+	if [ "$CY_MARGIN" -gt 0 ] && [ -n "$V_REMAIN" ] && [ "$V_REMAIN" -gt 0 ] && [ "$V_REMAIN" -le "$CY_MARGIN" ]; then
+		CY_TRIGGER=limit; return 0
+	fi
+	return 1
+}
+
+cycle_one() { # cycle_one <id> <label> <trigger> —— suspend → (可选停一会儿) → resume → 重新续租
+	c=$(wake_action "$1" suspend)
+	if [ "$c" != "202" ] && [ "$c" != "200" ]; then
+		log "轮转失败($3) $2: suspend HTTP $c"
+		return 1
+	fi
+	log "轮转($3) $2: suspend HTTP $c，等进入 suspended"
+	i=0
+	while [ "$i" -lt 8 ]; do
+		sleep 2
+		if http GET "/v1/machines/$1" && [ "$(jget "$HTTP_BODY" state)" = "suspended" ]; then break; fi
+		i=$((i + 1))
+	done
+	if [ "$i" -ge 8 ]; then log "轮转 $2: suspend 后没进入 suspended（下一轮再看）"; return 1; fi
+	parse_rng "$CY_HOLD" 0 0 600
+	hold=$RMIN
+	[ "$RMAX" -gt "$RMIN" ] && hold=$((RMIN + $(stable_rand "$1" $((RMAX - RMIN + 1)))))
+	# sh 版没有 KV，停机时长 600s 封顶（worker 版超长停机写 KV，这里直接封顶）
+	[ "$hold" -gt 600 ] && hold=600
+	[ "$hold" -gt 0 ] && { log "轮转 $2: 停机 ${hold}s"; sleep "$hold"; }
+	c=$(wake_action "$1" resume)
+	if [ "$c" = "202" ] || [ "$c" = "200" ]; then
+		log "轮转 $2: resume HTTP $c"
+	else
+		c=$(wake_action "$1" start)
+		log "轮转 $2: resume 被拒 → start HTTP $c"
+	fi
+	i=0
+	while [ "$i" -lt 12 ]; do
+		sleep "${INSTABOX_WAKE_GAP:-5}"
+		if http GET "/v1/machines/$1" && [ "$(jget "$HTTP_BODY" state)" = "running" ]; then
+			if http PUT "/v1/machines/$1/activity-leases/$LEASE" "{\"ttlSeconds\":$TTL}"; then
+				log "续租 ok（轮转后） $2/$LEASE 到期 $(jget "$HTTP_BODY" expiresAt)（连续运行计时已清零）"
+				return 0
+			fi
+			log "轮转 $2: 机器回来了但续租失败（下一轮再续）"
+			return 1
+		fi
+		i=$((i + 1))
+	done
+	log "轮转 $2: 机器还没 running（下一轮再续）"
+	return 1
+}
+
 renew_one() { # renew_one <id> <label>
+	# 轮转优先：该转就先转（转完顺手把租约续上）；每轮最多一台，其余排队下一轮。
+	# decide_cycle 不看 CY 开关也会先做冷却跳过判断（冷却期别白打唤醒接口）。
+	if [ "${CYCLED_ROUND:-0}" = "0" ]; then
+		decide_cycle "$1" "$2"
+		rc=$?
+		if [ "$rc" = "2" ]; then return 0; fi
+		if [ "$rc" = "0" ]; then
+			CYCLED_ROUND=1
+			cycle_one "$1" "$2" "$CY_TRIGGER"
+			return $?
+		fi
+	fi
 	if http PUT "/v1/machines/$1/activity-leases/$LEASE" "{\"ttlSeconds\":$TTL}"; then
 		log "续租 ok $2/$LEASE 到期 $(jget "$HTTP_BODY" expiresAt)"
 		return 0
@@ -277,6 +511,19 @@ status_one() { # status_one <id> <label>
 	log "$2 state=$(jget "$HTTP_BODY" state) \
 autoSuspendAfterSeconds=$(jget "$HTTP_BODY" autoSuspendAfterSeconds) \
 autoSuspendedAt=$(jget "$HTTP_BODY" autoSuspendedAt)"
+	if [ "$CY_ON" = "1" ]; then
+		mr=$(jget "$HTTP_BODY" maxRunMinutes)
+		case "$mr" in ''|*[!0-9]*) mr=-1 ;; esac
+		if [ "$mr" -gt 0 ]; then
+			se=$(iso_epoch "$(jget "$HTTP_BODY" runStartedAt)")
+			case "$se" in ''|*[!0-9]*) se="" ;; esac
+			if [ -n "$se" ]; then
+				rm_=$(( (se + mr * 60 - $(date +%s)) / 60 ))
+				[ "$rm_" -lt 0 ] && rm_=0
+				log "$2 maxRun 剩 ${rm_}min（轮转兜底 ${CY_MARGIN}min）"
+			fi
+		fi
+	fi
 	return 0
 }
 
@@ -344,6 +591,7 @@ each_key() { # each_key <fn> —— 对每把 key 执行一轮（fn 全局变量
 renew() { each_key renew_round; }
 
 renew_round() { # 每把 key 一轮：校验 → 机器筛选 → 逐台续租
+	CYCLED_ROUND=0
 	preflight_nocall && resolve && each_machine renew_one
 }
 
@@ -376,6 +624,12 @@ run_watch() { # 常驻（systemd / OpenRC 用）
 	preflight
 	if [ "$ALL" -eq 1 ]; then TARGET="全部机器（按 key 自动发现）"; else TARGET=$LABEL; fi
 	log "watch: 每 ${RENEW}s 续租 $TARGET/$LEASE（ttl ${TTL}s），API $API"
+	if [ "$CY_ON" = "1" ]; then
+		next_slot
+		log "轮转: 开（时间点 $CY_AT $CY_TZ，窗口 ${CY_WINDOW}min，兜底余量 ${CY_MARGIN}min）下一点 $NEXT_AT"
+	else
+		log "轮转: 关（INSTABOX_CYCLE=0，只续租）"
+	fi
 	while :; do
 		renew || log "这一轮有失败，下一轮再试"
 		sleep "$RENEW"
