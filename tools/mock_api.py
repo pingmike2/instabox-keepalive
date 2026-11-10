@@ -58,20 +58,12 @@ def current_state():
 
 
 def machine_obj(mid, name):
-    started = None
-    if STATE.get("started_age") is not None:
-        started = (datetime.now(timezone.utc) - timedelta(minutes=STATE["started_age"])).replace(
-            microsecond=0
-        ).isoformat().replace("+00:00", "Z")
     return {
         "id": mid,
         "name": name,
         "state": current_state(),
         "autoSuspendAfterSeconds": 1800,
         "autoSuspendedAt": None,
-        "maxRunMinutes": ARGS.maxrun,
-        "runStartedAt": started,
-        "cooldownUntil": STATE.get("cooldown_until"),
     }
 
 
@@ -159,15 +151,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(409, {"error": {"code": "operation_conflict", "message": "machine is stopped"}})
             with STATE_LOCK:
                 STATE["waking"] = True
-                STATE["started_age"] = 0  # resume 后连续运行计时清零（轮转「同一点只转一次」靠它）
             note(f"POST {path} 202")
             return self._send(202, {"operation": {"id": "op_resume", "state": "queued"}})
-
-        if path.endswith("/suspend"):
-            with STATE_LOCK:
-                STATE["state"] = "suspended"
-            note(f"POST {path} 202")
-            return self._send(202, {"operation": {"id": "op_suspend", "state": "queued"}})
 
         if path.endswith("/start"):
             if ARGS.scenario == "dead":
@@ -175,7 +160,6 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(409, {"error": {"code": "operation_conflict", "message": "cannot start"}})
             with STATE_LOCK:
                 STATE["waking"] = True
-                STATE["started_age"] = 0
             note(f"POST {path} 202")
             return self._send(202, {"operation": {"id": "op_start", "state": "queued"}})
 
@@ -195,23 +179,12 @@ def main():
     p.add_argument("--ttl", type=int, default=900)
     p.add_argument("--wake-polls", type=int, default=0,
                    help="唤醒后需要多少次 GET 才变 running（默认 0=下一次 GET 就是 running）")
-    p.add_argument("--maxrun", type=int, default=-1,
-                   help="机器的 maxRunMinutes（-1=无上限；配合 --started-age 测轮转兜底触发）")
-    p.add_argument("--started-age", type=int, default=0,
-                   help="runStartedAt 设为多少分钟前（<0 = 不下发该字段）")
-    p.add_argument("--cooldown-minutes", type=int, default=0,
-                   help="cooldownUntil 设为多少分钟后（>0 时模拟 max-run 强制挂起的冷却期）")
     p.add_argument("--require-key", action="store_true", help="没带 X-API-Key 就 401")
     p.add_argument("--log", default="")
     ARGS = p.parse_args()
 
     initial = {"suspended": "suspended", "stopped": "stopped", "dead": "suspended"}.get(ARGS.scenario, "running")
-    STATE = {"state": initial, "waking": False, "polls": ARGS.wake_polls,
-             "started_age": ARGS.started_age if ARGS.started_age >= 0 else None}
-    if ARGS.cooldown_minutes > 0:
-        cd = (datetime.now(timezone.utc) + timedelta(minutes=ARGS.cooldown_minutes)).replace(
-            microsecond=0).isoformat().replace("+00:00", "Z")
-        STATE["cooldown_until"] = cd
+    STATE = {"state": initial, "waking": False, "polls": ARGS.wake_polls}
 
     srv = ThreadingHTTPServer((ARGS.host, ARGS.port), Handler)
     # --port 0 表示让内核挑一个空闲端口，再把真实端口打出来给调用方读
